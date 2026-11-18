@@ -365,6 +365,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func rebuildMenu() {
         guard let menu = item.menu else { return }
         menu.removeAllItems()
+        menu.autoenablesItems = false   // 否则没有点击动作的行会被系统画成灰色
         let mono = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular)
         let advice = makeAdvice(statuses)
         if !advice.lines.isEmpty {
@@ -385,9 +386,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 menu.addItem(it)
             }
             for w in st.windows {
-                let line = "  \(w.label.padding(toLength: 10, withPad: " ", startingAt: 0)) \(bar(w.percent)) \(String(format: "%3.0f%%", w.percent))\(resetText(w.resetsAt))"
+                let line = "  \(w.label)\t\(bar(w.percent)) \(String(format: "%3.0f%%", w.percent))\(resetText(w.resetsAt))"
                 let it = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-                it.attributedTitle = NSAttributedString(string: line, attributes: [.font: mono, .foregroundColor: color(w.percent)])
+                let para = NSMutableParagraphStyle()
+                para.tabStops = [NSTextTab(textAlignment: .left, location: 110)]   // 用制表位对齐进度条
+                it.attributedTitle = NSAttributedString(string: line, attributes: [.font: mono, .foregroundColor: color(w.percent), .paragraphStyle: para])
                 menu.addItem(it)
             }
             if st.error == nil && st.windows.isEmpty { menu.addItem(NSMenuItem(title: "  暂无数据", action: nil, keyEquivalent: "")) }
