@@ -59,6 +59,9 @@ struct AccountStatus {
     var windows: [Window] = []
     var plan: String?
     var error: String?
+    var errorCode: Int?
+    var fetchedAt: Date?
+    var staleNote: String?   // 显示的是旧数据时的说明（例如接口限流）
 
     /// 菜单栏显示的数字：总额度里用得最多的那个（模型专属额度只在菜单里显示）
     var headline: Double? { windows.filter { $0.model == nil }.map(\.percent).max() }
@@ -239,14 +242,20 @@ func fetchClaude(_ acc: AccountConfig, claudePath: String) async -> AccountStatu
             }
         }
         // 显示实际登录的是哪个账号 / 哪种套餐，防止串号
-        if let p = try? await getJSON("https://api.anthropic.com/api/oauth/profile",
+        if let cached = profileCache[acc.name], cached.at.timeIntervalSinceNow > -6 * 3600 {
+            st.plan = cached.plan
+        } else if let p = try? await getJSON("https://api.anthropic.com/api/oauth/profile",
                                       headers: ["Authorization": "Bearer \(token)", "anthropic-beta": "oauth-2025-04-20"]) {
             let org = p["organization"] as? [String: Any]
             let email = (p["account"] as? [String: Any])?["email"] as? String
             let type = (org?["organization_type"] as? String)?.replacingOccurrences(of: "claude_", with: "")
             st.plan = [type ?? st.plan, email].compactMap { $0 }.joined(separator: " · ")
+            profileCache[acc.name] = (st.plan ?? "", Date())
         }
-    } catch { st.error = error.localizedDescription }
+    } catch {
+        st.error = error.localizedDescription
+        st.errorCode = (error as NSError).code
+    }
     return st
 }
 
@@ -281,11 +290,50 @@ func fetchCodex(_ acc: AccountConfig) async -> AccountStatus {
     return st
 }
 
+// 刷新只在一个后台任务里串行进行，这些缓存不会被并发访问
+var profileCache: [String: (plan: String, at: Date)] = [:]
+var lastGood: [String: AccountStatus] = [:]
+var backoff: [String: (until: Date, fails: Int)] = [:]
+
+func hhmm(_ d: Date) -> String { let f = DateFormatter(); f.dateFormat = "HH:mm"; return f.string(from: d) }
+
+/// 接口限流或临时出错时：继续显示上次成功的数据，并且逐步拉长重试间隔（5→10→20→40→60 分钟）
 func fetchAll(_ cfg: AppConfig) async -> [AccountStatus] {
     let claudePath = cfg.claudePath ?? "~/.local/bin/claude"
     var results: [AccountStatus] = []
     for acc in cfg.accounts {
-        results.append(acc.type == "codex" ? await fetchCodex(acc) : await fetchClaude(acc, claudePath: claudePath))
+        let key = acc.name
+        if let b = backoff[key], b.until > Date() {   // 还在等待重试，不发请求
+            if var old = lastGood[key] {
+                old.staleNote = "接口限流，显示 \(hhmm(old.fetchedAt ?? Date())) 的数据，\(hhmm(b.until)) 后重试"
+                results.append(old)
+            } else {
+                var st = AccountStatus(config: acc)
+                st.error = "接口限流，\(hhmm(b.until)) 后自动重试"
+                results.append(st)
+            }
+            continue
+        }
+        var st = acc.type == "codex" ? await fetchCodex(acc) : await fetchClaude(acc, claudePath: claudePath)
+        if st.error == nil {
+            st.fetchedAt = Date()
+            lastGood[key] = st
+            backoff[key] = nil
+        } else if st.errorCode == 429 || (st.errorCode ?? 0) >= 500 || st.errorCode == NSURLErrorTimedOut
+                    || st.errorCode == NSURLErrorNotConnectedToInternet || st.errorCode == NSURLErrorNetworkConnectionLost {
+            let fails = (backoff[key]?.fails ?? 0) + 1
+            let mins = min(5 * pow(2, Double(fails - 1)), 60)
+            let until = Date().addingTimeInterval(mins * 60)
+            backoff[key] = (until, fails)
+            let reason = st.errorCode == 429 ? "接口限流" : "网络或服务暂时出错"
+            if var old = lastGood[key] {
+                old.staleNote = "\(reason)，显示 \(hhmm(old.fetchedAt ?? Date())) 的数据，\(hhmm(until)) 后重试"
+                st = old
+            } else {
+                st.error = "\(reason)，\(hhmm(until)) 后自动重试"
+            }
+        }
+        results.append(st)
     }
     return results
 }
@@ -385,6 +433,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let it = NSMenuItem(title: "  ⚠️ " + e, action: nil, keyEquivalent: "")
                 menu.addItem(it)
             }
+            if let note = st.staleNote {
+                let it = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+                it.attributedTitle = NSAttributedString(string: "  ⏸ " + note, attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.secondaryLabelColor])
+                menu.addItem(it)
+            }
             for w in st.windows {
                 let line = "  \(w.label)\t\(bar(w.percent)) \(String(format: "%3.0f%%", w.percent))\(resetText(w.resetsAt))"
                 let it = NSMenuItem(title: "", action: nil, keyEquivalent: "")
@@ -415,11 +468,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 if CommandLine.arguments.contains("--dump") {
     let sem = DispatchSemaphore(value: 0)
     Task.detached {
-        for st in await fetchAll(loadConfig()) {
-            print("\(st.config.name) [\(st.plan ?? "?")]" + (st.error.map { "  ⚠️ \($0)" } ?? ""))
+        let all = await fetchAll(loadConfig())
+        for st in all {
+            print("\(st.config.name) [\(st.plan ?? "?")]" + (st.error.map { "  ⚠️ \($0)" } ?? "") + (st.staleNote.map { "  ⏸ \($0)" } ?? ""))
             for w in st.windows { print("  \(w.label)  \(bar(w.percent)) \(Int(w.percent))%\(resetText(w.resetsAt))") }
         }
-        let all = await fetchAll(loadConfig())
         print("\n推荐（菜单栏标 ▸ 的账号）:")
         for l in makeAdvice(all).lines { print("  " + l) }
         sem.signal()
