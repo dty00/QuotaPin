@@ -61,6 +61,7 @@ struct AccountStatus {
     var plan: String?
     var error: String?
     var errorCode: Int?
+    var retryAfter: Double?
     var fetchedAt: Date?
     var staleNote: String?   // 显示的是旧数据时的说明（例如接口限流）
 
@@ -163,6 +164,18 @@ func parseISO(_ s: String?) -> Date? {
     return f.date(from: s)
 }
 
+/// 简单日志：~/Library/Logs/QuotaPin.log（只记录账号名和结果，不记录 token）
+let logURL = URL(fileURLWithPath: home + "/Library/Logs/QuotaPin.log")
+func log(_ msg: String) {
+    let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    let line = "\(f.string(from: Date()))  \(msg)\n"
+    if let h = try? FileHandle(forWritingTo: logURL) {
+        h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close()
+    } else {
+        try? Data(line.utf8).write(to: logURL)
+    }
+}
+
 func getJSON(_ url: String, headers: [String: String]) async throws -> [String: Any] {
     var req = URLRequest(url: URL(string: url)!)
     req.timeoutInterval = 20
@@ -172,7 +185,11 @@ func getJSON(_ url: String, headers: [String: String]) async throws -> [String: 
     let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
     if code != 200 {
         let msg = ((obj?["error"] as? [String: Any])?["message"] as? String) ?? "HTTP \(code)"
-        throw NSError(domain: "QuotaPin", code: code, userInfo: [NSLocalizedDescriptionKey: msg])
+        var info: [String: Any] = [NSLocalizedDescriptionKey: msg]
+        if let ra = (resp as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After"), let secs = Double(ra), secs > 0 {
+            info["retryAfter"] = secs
+        }
+        throw NSError(domain: "QuotaPin", code: code, userInfo: info)
     }
     return obj ?? [:]
 }
@@ -315,6 +332,7 @@ func fetchClaude(_ acc: AccountConfig) async -> AccountStatus {
     } catch {
         st.error = error.localizedDescription
         st.errorCode = (error as NSError).code
+        st.retryAfter = (error as NSError).userInfo["retryAfter"] as? Double
     }
     return st
 }
@@ -346,6 +364,8 @@ func fetchCodex(_ acc: AccountConfig) async -> AccountStatus {
         }
     } catch {
         st.error = (error as NSError).code == 401 ? "登录过期：运行一次 codex 即可刷新" : error.localizedDescription
+        st.errorCode = (error as NSError).code
+        st.retryAfter = (error as NSError).userInfo["retryAfter"] as? Double
     }
     return st
 }
@@ -357,12 +377,13 @@ var backoff: [String: (until: Date, fails: Int)] = [:]
 
 func hhmm(_ d: Date) -> String { let f = DateFormatter(); f.dateFormat = "HH:mm"; return f.string(from: d) }
 
-/// 接口限流或临时出错时：继续显示上次成功的数据，并且逐步拉长重试间隔（5→10→20→40→60 分钟）
-func fetchAll(_ cfg: AppConfig) async -> [AccountStatus] {
+/// 接口限流或临时出错时：继续显示上次成功的数据，并且逐步拉长重试间隔（2→4→8→16→30 分钟，接口给了 Retry-After 就按它来）。
+/// force = true（手动点"立即刷新"）时忽略等待，直接请求。
+func fetchAll(_ cfg: AppConfig, force: Bool = false) async -> [AccountStatus] {
     var results: [AccountStatus] = []
     for acc in cfg.accounts {
         let key = acc.name
-        if let b = backoff[key], b.until > Date() {   // 还在等待重试，不发请求
+        if !force, let b = backoff[key], b.until > Date() {   // 还在等待重试，不发请求
             if var old = lastGood[key] {
                 old.staleNote = "接口限流，显示 \(hhmm(old.fetchedAt ?? Date())) 的数据，\(hhmm(b.until)) 后重试"
                 results.append(old)
@@ -378,11 +399,13 @@ func fetchAll(_ cfg: AppConfig) async -> [AccountStatus] {
             st.fetchedAt = Date()
             lastGood[key] = st
             backoff[key] = nil
+            log("\(key): ok " + st.windows.map { "\($0.label) \(Int($0.pct))%" }.joined(separator: ", "))
         } else if st.errorCode == 429 || (st.errorCode ?? 0) >= 500 || st.errorCode == NSURLErrorTimedOut
                     || st.errorCode == NSURLErrorNotConnectedToInternet || st.errorCode == NSURLErrorNetworkConnectionLost {
             let fails = (backoff[key]?.fails ?? 0) + 1
-            let mins = min(5 * pow(2, Double(fails - 1)), 60)
-            let until = Date().addingTimeInterval(mins * 60)
+            let secs = st.retryAfter ?? min(120 * pow(2, Double(fails - 1)), 1800)
+            let until = Date().addingTimeInterval(secs)
+            log("\(key): HTTP \(st.errorCode ?? 0) \(st.error ?? "")，第 \(fails) 次，\(Int(secs))s 后重试")
             backoff[key] = (until, fails)
             let reason = st.errorCode == 429 ? "接口限流" : "网络或服务暂时出错"
             if var old = lastGood[key] {
@@ -391,6 +414,8 @@ func fetchAll(_ cfg: AppConfig) async -> [AccountStatus] {
             } else {
                 st.error = "\(reason)，\(hhmm(until)) 后自动重试"
             }
+        } else {
+            log("\(key): 错误 \(st.error ?? "")")
         }
         results.append(st)
     }
@@ -436,12 +461,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuWillOpen(_ menu: NSMenu) { rebuildMenu() }   // 让“几小时后重置”保持最新
 
-    @objc func refresh() {
+    @objc func refresh() { doRefresh(force: false) }
+    @objc func manualRefresh() { doRefresh(force: true) }
+
+    func doRefresh(force: Bool) {
         guard !loading else { return }
         loading = true
         let cfg = loadConfig()
         Task.detached {
-            let results = await fetchAll(cfg)
+            let results = await fetchAll(cfg, force: force)
             await MainActor.run {
                 self.statuses = results
                 self.lastUpdate = Date()
@@ -464,7 +492,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             s.append(NSAttributedString(string: (isBest ? "▸" : "") + st.config.short + " ",
                                         attributes: [.font: font, .foregroundColor: isBest ? NSColor.controlAccentColor : NSColor.secondaryLabelColor]))
             s.append(NSAttributedString(string: val,
-                                        attributes: [.font: font, .foregroundColor: st.headline.map(color) ?? NSColor.secondaryLabelColor]))
+                                        attributes: [.font: font, .foregroundColor: st.staleNote != nil ? NSColor.tertiaryLabelColor   // 旧数据显示为浅灰
+                                                     : st.headline.map(color) ?? NSColor.secondaryLabelColor]))
         }
         item.button?.attributedTitle = s
     }
@@ -514,7 +543,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             menu.addItem(NSMenuItem(title: "加载中…", action: nil, keyEquivalent: ""))
         }
-        let r = NSMenuItem(title: "立即刷新", action: #selector(refresh), keyEquivalent: "r"); r.target = self; menu.addItem(r)
+        let r = NSMenuItem(title: "立即刷新", action: #selector(manualRefresh), keyEquivalent: "r"); r.target = self; menu.addItem(r)
         let c = NSMenuItem(title: "编辑账号配置…", action: #selector(openConfig), keyEquivalent: ","); c.target = self; menu.addItem(c)
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
