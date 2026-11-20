@@ -47,7 +47,7 @@ QuotaPin 不需要你输入任何密码或 key，它直接复用命令行工具�
 | Claude（第二个账号） | `CLAUDE_CONFIG_DIR=~/.claude-account2 claude auth login` | 钥匙串 `Claude Code-credentials-<hash>` |
 | Codex | `codex login` | `~/.codex/auth.json` |
 
-Claude 的登录过期时，QuotaPin 会调用 `claude auth status` 让 Claude Code 自己刷新，所以不会把你的 Claude Code 登出。
+Claude 的登录过期时（大约每 8 小时），QuotaPin 会用 refresh token 换一个新 token，并按 Claude Code 的格式写回钥匙串，Claude Code 下次直接用新的，不会被登出。注意：token 过期时用量接口返回的是 429，看起来像限流。
 
 ## 配置
 
@@ -60,7 +60,6 @@ Claude 的登录过期时，QuotaPin 会调用 `claude auth status` 让 Claude C
     { "type": "claude", "name": "Claude 2", "short": "C2", "configDir": "~/.claude-account2" },
     { "type": "codex",  "name": "Codex",    "short": "X" }
   ],
-  "claudePath": "~/.local/bin/claude",
   "refreshMinutes": 5
 }
 ```

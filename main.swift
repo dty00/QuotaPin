@@ -16,7 +16,6 @@ struct AccountConfig: Codable {
 
 struct AppConfig: Codable {
     var accounts: [AccountConfig]
-    var claudePath: String?
     var refreshMinutes: Int?
 }
 
@@ -36,7 +35,6 @@ func loadConfig() -> AppConfig {
             AccountConfig(type: "claude", name: "Claude 2", short: "C2", configDir: "~/.claude-account2"),
             AccountConfig(type: "codex", name: "Codex", short: "X", configDir: nil),
         ],
-        claudePath: "~/.local/bin/claude",
         refreshMinutes: 5)
     try? FileManager.default.createDirectory(at: configURL.deletingLastPathComponent(), withIntermediateDirectories: true)
     let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -52,6 +50,9 @@ struct Window {
     var resetsAt: Date?
     var kind: String = ""   // session / weekly_all / weekly_scoped
     var model: String?      // 按模型计算的额度对应的模型名，例如 Fable
+
+    /// 显示用的百分比：重置时间已过（数据是旧的）就当作 0%
+    var pct: Double { (resetsAt.map { $0 < Date() } ?? false) ? 0 : percent }
 }
 
 struct AccountStatus {
@@ -64,7 +65,7 @@ struct AccountStatus {
     var staleNote: String?   // 显示的是旧数据时的说明（例如接口限流）
 
     /// 菜单栏显示的数字：总额度里用得最多的那个（模型专属额度只在菜单里显示）
-    var headline: Double? { windows.filter { $0.model == nil }.map(\.percent).max() }
+    var headline: Double? { windows.filter { $0.model == nil }.map(\.pct).max() }
     var session: Window? { windows.first { $0.kind == "session" } }
     var weekly: Window? { windows.first { $0.model == nil && $0.kind.hasPrefix("weekly") } ?? windows.first { $0.label == "每周" } }
     var scoped: [Window] { windows.filter { $0.model != nil } }
@@ -87,12 +88,12 @@ func makeAdvice(_ all: [AccountStatus]) -> Advice {
 
     func hoursLeft(_ w: Window?) -> Double? { w?.resetsAt.map { max($0.timeIntervalSinceNow / 3600, 0.1) } }
     func blocked(_ s: AccountStatus) -> String? {
-        if let w = s.weekly, w.percent >= 98 { return "每周额度已满" }
-        if let w = s.session, w.percent >= 98 { return "5 小时额度已满" + resetText(w.resetsAt) }
+        if let w = s.weekly, w.pct >= 98 { return "每周额度已满" }
+        if let w = s.session, w.pct >= 98 { return "5 小时额度已满" + resetText(w.resetsAt) }
         return nil
     }
     func urgency(_ s: AccountStatus) -> Double {
-        let remain = 100 - (s.weekly?.percent ?? 0)
+        let remain = 100 - (s.weekly?.pct ?? 0)
         // 还没开始计时的每周窗口（没有重置时间）不会浪费，紧迫度最低
         guard let h = hoursLeft(s.weekly) else { return remain / (7 * 24) * 0.5 }
         return remain / h
@@ -107,7 +108,7 @@ func makeAdvice(_ all: [AccountStatus]) -> Advice {
         lines.insert("两个 Claude 账号现在都用不了", at: 0)
         return Advice(best: nil, lines: lines)
     }
-    let remain = 100 - (best.weekly?.percent ?? 0)
+    let remain = 100 - (best.weekly?.pct ?? 0)
     var why = "还剩 \(Int(remain))%"
     if let h = hoursLeft(best.weekly) { why += "，\(fmtHours(h))后清零" }
     lines.insert("👉 现在先用 \(best.config.short)（\(best.config.name)）：\(why)", at: 0)
@@ -115,17 +116,17 @@ func makeAdvice(_ all: [AccountStatus]) -> Advice {
     // 节奏：要在重置前用完，每 5 小时大约该用多少
     for s in usable {
         guard let h = hoursLeft(s.weekly) else { continue }
-        let rem = 100 - (s.weekly?.percent ?? 0)
+        let rem = 100 - (s.weekly?.pct ?? 0)
         let per5h = rem / max(h / 5, 1)
         lines.append("\(s.config.short) 想在重置前用完：每 5 小时约用掉每周额度的 \(String(format: "%.1f", per5h))%")
     }
 
     // 模型专属额度快满时的提示
     for s in claude {
-        for w in s.scoped where w.percent >= 80 {
+        for w in s.scoped where w.pct >= 80 {
             let m = w.model ?? "该模型"
             let others = usable.filter { $0.config.short != s.config.short }.map(\.config.short)
-            var t = "\(s.config.short) 的 \(m) 额度已用 \(Int(w.percent))%"
+            var t = "\(s.config.short) 的 \(m) 额度已用 \(Int(w.pct))%"
             t += others.isEmpty ? "，省着用" : "：在 \(s.config.short) 上改用其他模型，要用 \(m) 就切到 \(others.joined(separator: "/"))"
             lines.append(t)
         }
@@ -185,28 +186,87 @@ func claudeKeychainService(configDir: String?) -> String {
     return "Claude Code-credentials-" + hash.prefix(8)
 }
 
-func readClaudeCreds(configDir: String?) -> [String: Any]? {
-    let (code, out) = run("/usr/bin/security", ["find-generic-password", "-s", claudeKeychainService(configDir: configDir), "-w"])
-    var raw: Data? = code == 0 ? out.trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8) : nil
-    if raw == nil, let dir = configDir {   // 兜底：部分环境存在文件里
-        raw = try? Data(contentsOf: URL(fileURLWithPath: expand(dir) + "/.credentials.json"))
+/// 凭据存放位置：钥匙串（带账户名）或 configDir 下的 .credentials.json
+enum CredsSource { case keychain(service: String, account: String), file(String) }
+
+func readClaudeCredsFull(configDir: String?) -> (doc: [String: Any], source: CredsSource)? {
+    let svc = claudeKeychainService(configDir: configDir)
+    let (code, out) = run("/usr/bin/security", ["find-generic-password", "-s", svc, "-w"])
+    if code == 0, let data = out.trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8),
+       let doc = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        // 写回时要用同一个钥匙串账户名
+        let attrs = run("/usr/bin/security", ["find-generic-password", "-s", svc]).1
+        let acct = attrs.range(of: #""acct"<blob>="([^"]*)""#, options: .regularExpression)
+            .map { String(attrs[$0].dropFirst(14).dropLast()) } ?? NSUserName()
+        return (doc, .keychain(service: svc, account: acct))
     }
-    guard let raw, let obj = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] else { return nil }
-    return obj["claudeAiOauth"] as? [String: Any]
+    if let dir = configDir {   // 兜底：部分环境存在文件里
+        let path = expand(dir) + "/.credentials.json"
+        if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+           let doc = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            return (doc, .file(path))
+        }
+    }
+    return nil
 }
 
-func fetchClaude(_ acc: AccountConfig, claudePath: String) async -> AccountStatus {
+func readClaudeCreds(configDir: String?) -> [String: Any]? {
+    readClaudeCredsFull(configDir: configDir)?.doc["claudeAiOauth"] as? [String: Any]
+}
+
+/// 登录过期时用 refresh token 换新 token，并按 Claude Code 的格式写回原处，Claude Code 下次启动会直接用新的。
+/// 返回 nil 表示成功，否则是错误说明。
+func refreshClaude(configDir: String?) async -> String? {
+    guard let (doc, source) = readClaudeCredsFull(configDir: configDir),
+          var oauth = doc["claudeAiOauth"] as? [String: Any],
+          let refresh = oauth["refreshToken"] as? String else { return "找不到登录信息" }
+    var req = URLRequest(url: URL(string: "https://platform.claude.com/v1/oauth/token")!)
+    req.httpMethod = "POST"
+    req.timeoutInterval = 20
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.setValue("claude-cli/2.1 (external, cli)", forHTTPHeaderField: "User-Agent")   // 默认 UA 会被 Cloudflare 拦截
+    req.httpBody = try? JSONSerialization.data(withJSONObject: [
+        "grant_type": "refresh_token", "refresh_token": refresh,
+        "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e"])
+    guard let (data, resp) = try? await URLSession.shared.data(for: req) else { return "网络错误" }
+    let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+    guard code == 200, let r = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+          let access = r["access_token"] as? String else {
+        return code == 400 || code == 401 ? "登录已失效" : "刷新登录失败（HTTP \(code)）"
+    }
+    oauth["accessToken"] = access
+    if let nr = r["refresh_token"] as? String { oauth["refreshToken"] = nr }
+    let ttl = (r["expires_in"] as? Double) ?? 3600
+    oauth["expiresAt"] = Int((Date().timeIntervalSince1970 + ttl) * 1000)
+    var newDoc = doc
+    newDoc["claudeAiOauth"] = oauth
+    guard let json = try? JSONSerialization.data(withJSONObject: newDoc),
+          let text = String(data: json, encoding: .utf8) else { return "写回登录信息失败" }
+    switch source {
+    case .keychain(let svc, let acct):
+        if run("/usr/bin/security", ["add-generic-password", "-U", "-a", acct, "-s", svc, "-w", text]).0 != 0 {
+            return "写回钥匙串失败"
+        }
+    case .file(let path):
+        do { try json.write(to: URL(fileURLWithPath: path), options: .atomic) } catch { return "写回登录文件失败" }
+    }
+    return nil
+}
+
+func fetchClaude(_ acc: AccountConfig) async -> AccountStatus {
     var st = AccountStatus(config: acc)
     var creds = readClaudeCreds(configDir: acc.configDir)
     let expired: Bool = {
-        guard let ms = creds?["expiresAt"] as? Double else { return true }
-        return ms / 1000 < Date().timeIntervalSince1970 + 60
+        guard let ms = (creds?["expiresAt"] as? NSNumber)?.doubleValue else { return true }
+        return ms / 1000 < Date().timeIntervalSince1970 + 120
     }()
-    if creds == nil || expired {
-        // 让 Claude Code 自己刷新 token（并写回钥匙串），避免和它抢 refresh token
-        var env: [String: String] = [:]
-        if let dir = acc.configDir { env["CLAUDE_CONFIG_DIR"] = expand(dir) }
-        run(expand(claudePath), ["auth", "status"], env: env)
+    // 注意：token 过期时用量接口返回的是 429（看起来像限流），所以必须先刷新
+    if creds != nil && expired {
+        if let err = await refreshClaude(configDir: acc.configDir) {
+            let login = acc.configDir == nil ? "claude auth login" : "CLAUDE_CONFIG_DIR=\(acc.configDir!) claude auth login"
+            st.error = err == "登录已失效" ? "登录已失效：在终端运行 \(login)" : err
+            return st
+        }
         creds = readClaudeCreds(configDir: acc.configDir)
     }
     guard let token = creds?["accessToken"] as? String else {
@@ -299,7 +359,6 @@ func hhmm(_ d: Date) -> String { let f = DateFormatter(); f.dateFormat = "HH:mm"
 
 /// 接口限流或临时出错时：继续显示上次成功的数据，并且逐步拉长重试间隔（5→10→20→40→60 分钟）
 func fetchAll(_ cfg: AppConfig) async -> [AccountStatus] {
-    let claudePath = cfg.claudePath ?? "~/.local/bin/claude"
     var results: [AccountStatus] = []
     for acc in cfg.accounts {
         let key = acc.name
@@ -314,7 +373,7 @@ func fetchAll(_ cfg: AppConfig) async -> [AccountStatus] {
             }
             continue
         }
-        var st = acc.type == "codex" ? await fetchCodex(acc) : await fetchClaude(acc, claudePath: claudePath)
+        var st = acc.type == "codex" ? await fetchCodex(acc) : await fetchClaude(acc)
         if st.error == nil {
             st.fetchedAt = Date()
             lastGood[key] = st
@@ -400,7 +459,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for (i, st) in statuses.enumerated() {
             if i > 0 { s.append(NSAttributedString(string: "  ", attributes: [.font: font])) }
             var val = st.headline.map { "\(Int($0.rounded()))%" } ?? "–"
-            if st.scoped.contains(where: { $0.percent >= 90 }) { val += "!" }   // 某个模型的专属额度快满了
+            if st.scoped.contains(where: { $0.pct >= 90 }) { val += "!" }   // 某个模型的专属额度快满了
             let isBest = st.config.short == best
             s.append(NSAttributedString(string: (isBest ? "▸" : "") + st.config.short + " ",
                                         attributes: [.font: font, .foregroundColor: isBest ? NSColor.controlAccentColor : NSColor.secondaryLabelColor]))
@@ -439,11 +498,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 menu.addItem(it)
             }
             for w in st.windows {
-                let line = "  \(w.label)\t\(bar(w.percent)) \(String(format: "%3.0f%%", w.percent))\(resetText(w.resetsAt))"
+                let line = "  \(w.label)\t\(bar(w.pct)) \(String(format: "%3.0f%%", w.pct))\(resetText(w.resetsAt))"
                 let it = NSMenuItem(title: "", action: nil, keyEquivalent: "")
                 let para = NSMutableParagraphStyle()
                 para.tabStops = [NSTextTab(textAlignment: .left, location: 110)]   // 用制表位对齐进度条
-                it.attributedTitle = NSAttributedString(string: line, attributes: [.font: mono, .foregroundColor: color(w.percent), .paragraphStyle: para])
+                it.attributedTitle = NSAttributedString(string: line, attributes: [.font: mono, .foregroundColor: color(w.pct), .paragraphStyle: para])
                 menu.addItem(it)
             }
             if st.error == nil && st.windows.isEmpty { menu.addItem(NSMenuItem(title: "  暂无数据", action: nil, keyEquivalent: "")) }
@@ -471,7 +530,7 @@ if CommandLine.arguments.contains("--dump") {
         let all = await fetchAll(loadConfig())
         for st in all {
             print("\(st.config.name) [\(st.plan ?? "?")]" + (st.error.map { "  ⚠️ \($0)" } ?? "") + (st.staleNote.map { "  ⏸ \($0)" } ?? ""))
-            for w in st.windows { print("  \(w.label)  \(bar(w.percent)) \(Int(w.percent))%\(resetText(w.resetsAt))") }
+            for w in st.windows { print("  \(w.label)  \(bar(w.pct)) \(Int(w.pct))%\(resetText(w.resetsAt))") }
         }
         print("\n推荐（菜单栏标 ▸ 的账号）:")
         for l in makeAdvice(all).lines { print("  " + l) }
